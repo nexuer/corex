@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package corex.log;
+
+option go_package = "github.com/nexuer/corex/log;log";
+
+import "google/protobuf/descriptor.proto";
+
+message Options {
+  string format = 1;
+  string level = 2;
+  string output = 3;
+  string dir = 4;
+  int64 maxSize = 5; //MB
+  int64 maxBackups = 6;
+}

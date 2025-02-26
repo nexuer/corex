@@ -1,0 +1,57 @@
+{{ $svr := .ServiceName }}
+{{ $svrFullName := .ServiceFullName }}
+
+{{- if gt (len .MethodSets) 0 }}
+const (
+    {{- range .MethodSets }}
+    {{ $svr }}_{{ .OriginalName }}_Operation = "/{{ $svrFullName }}/{{ .OriginalName }}"
+    {{- end }}
+)
+{{- end }}
+
+type {{ $svr }}HTTPServer interface {
+{{- range .MethodSets }}
+    {{- if ne .Comment "" }}
+    {{ .Comment }}
+    {{- end }}
+    {{ .Name }}(context.Context, *{{ .Request }}) (*{{ .Reply }}, error)
+{{- end }}
+}
+
+func Register{{ $svr }}HTTPServer(s *http.Server, srv {{ $svr }}HTTPServer) {
+    r := s.Route("/")
+{{- range .Methods }}
+    r.{{ .Method }}("{{ .Path }}", _{{ $svr }}_{{ .Name }}_{{ .Num }}_HTTP_Handler(srv))
+{{- end }}
+}
+
+{{ range .Methods }}
+func _{{ $svr }}_{{ .Name }}_{{ .Num }}_HTTP_Handler(srv {{ $svr }}HTTPServer) func(ctx http.Context) error {
+    return func(ctx http.Context) error {
+        var in {{ .Request }}
+        {{- if .HasBody }}
+            if err := ctx.Bind(&in{{ .Body }}); err != nil {
+            return err
+            }
+        {{- end }}
+        if err := ctx.BindQuery(&in); err != nil {
+            return err
+        }
+        {{- if .HasVars }}
+            if err := ctx.BindVars(&in); err != nil {
+                return err
+            }
+        {{- end }}
+        http.SetOperation(ctx, {{ $svr }}_{{ .OriginalName }}_Operation)
+        h := ctx.Middleware(func(ctx context.Context, req interface{}) (interface{}, error) {
+            return srv.{{ .Name }}(ctx, req.(*{{ .Request }}))
+        })
+        out, err := h(ctx, &in)
+        if err != nil {
+            return err
+        }
+        reply := out.(*{{ .Reply }})
+            return ctx.Result(200, reply{{ .ResponseBody }})
+        }
+    }
+{{ end }}
