@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -17,14 +18,17 @@ import (
 )
 
 const (
-	contextPackage = protogen.GoImportPath("context")
-	httpPackage    = protogen.GoImportPath("github.com/nexuer/corex/transport/http")
+	contextPackage   = protogen.GoImportPath("context")
+	httpPackage      = protogen.GoImportPath("github.com/nexuer/corex/transport/http")
+	httpBodyFullName = protoreflect.FullName("google.api.HttpBody")
 )
 
 var methodSets = make(map[string]int)
 
+var pathVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // generateFile generates a _http.pb.go file.
-func generateFile(gen *protogen.Plugin, file *protogen.File) *protogen.GeneratedFile {
+func generateFile(gen *protogen.Plugin, file *protogen.File, prefix string) *protogen.GeneratedFile {
 	if len(file.Services) == 0 || !hasHttpRule(file.Services) {
 		return nil
 	}
@@ -42,57 +46,53 @@ func generateFile(gen *protogen.Plugin, file *protogen.File) *protogen.Generated
 	g.P()
 	g.P("package ", file.GoPackageName)
 	g.P()
-	generateFileContent(gen, file, g)
+	generateFileContent(gen, file, g, prefix)
 	return g
 }
 
 // generateFileContent generates the http service definitions, excluding the package statement.
-func generateFileContent(gen *protogen.Plugin, file *protogen.File, g *protogen.GeneratedFile) {
+func generateFileContent(gen *protogen.Plugin, file *protogen.File, g *protogen.GeneratedFile, prefix string) {
 	if len(file.Services) == 0 {
 		return
 	}
 
 	g.P("// This is a compile-time assertion to ensure that this generated file")
-	g.P("// is compatible with the grpc package it is being compiled against.")
+	g.P("// is compatible with the http package it is being compiled against.")
 	g.P("var _ = new(", contextPackage.Ident("Context"), ")")
 	g.P("const _ = ", httpPackage.Ident("SupportPackageIsVersion1"))
 	g.P()
 	for _, service := range file.Services {
-		genService(gen, file, g, service)
+		genService(gen, file, g, service, prefix)
 	}
 }
 
-func genService(gen *protogen.Plugin, file *protogen.File, g *protogen.GeneratedFile, service *protogen.Service) {
+func genService(gen *protogen.Plugin, file *protogen.File, g *protogen.GeneratedFile, service *protogen.Service, prefix string) {
 	if service.Desc.Options().(*descriptorpb.ServiceOptions).GetDeprecated() {
 		g.P("//")
 		g.P(deprecationComment)
 	}
 
-	desc := &serviceDesc{
-		ServiceName:     service.GoName,
-		ServiceFullName: string(service.Desc.FullName()),
-		Metadata:        file.Desc.Path(),
+	sd := &serviceDesc{
+		ServiceType: service.GoName,
+		ServiceName: string(service.Desc.FullName()),
+		Metadata:    file.Desc.Path(),
 	}
 
 	for _, method := range service.Methods {
-		if !isHttpMethod(method) {
-			continue
-		}
 		rule, ok := proto.GetExtension(method.Desc.Options(), annotations.E_Http).(*annotations.HttpRule)
 		if rule != nil && ok {
 			for _, bind := range rule.AdditionalBindings {
-				desc.Methods = append(desc.Methods, buildHTTPRule(g, service, method, bind))
+				sd.Methods = append(sd.Methods, buildHTTPRule(g, service, method, bind, prefix))
 			}
-			desc.Methods = append(desc.Methods, buildHTTPRule(g, service, method, rule))
+			sd.Methods = append(sd.Methods, buildHTTPRule(g, service, method, rule, prefix))
 		}
 	}
-	if len(desc.Methods) > 0 {
-		g.P(desc.template())
+	if len(sd.Methods) > 0 {
+		g.P(sd.execute())
 	}
 }
 
-func buildHTTPRule(g *protogen.GeneratedFile, service *protogen.Service, m *protogen.Method,
-	rule *annotations.HttpRule) *methodDesc {
+func buildHTTPRule(g *protogen.GeneratedFile, service *protogen.Service, m *protogen.Method, rule *annotations.HttpRule, prefix string) *methodDesc {
 	var (
 		path         string
 		method       string
@@ -100,6 +100,13 @@ func buildHTTPRule(g *protogen.GeneratedFile, service *protogen.Service, m *prot
 		responseBody string
 	)
 
+	// google.api.http 的 pattern 决定 HTTP 方法和原始路径模板。
+	// 路径模板刻意收敛为接近 Go ServeMux 的子集：
+	//   get: "/v1/users/{id}"       -> 单段路径变量
+	//   get: "/v1/files/{path...}"  -> 尾部多段路径变量
+	//   post: "/v1/users" body:"*"  -> 整个请求作为 body
+	//   custom { kind:"REPORT" path:"/v1/report" } -> 自定义 HTTP 方法
+	// 路径变量必须是完整 path segment，变量名必须是普通标识符。
 	switch pattern := rule.Pattern.(type) {
 	case *annotations.HttpRule_Get:
 		path = pattern.Get
@@ -128,129 +135,138 @@ func buildHTTPRule(g *protogen.GeneratedFile, service *protogen.Service, m *prot
 		path = fmt.Sprintf("/%s/%s", service.Desc.FullName(), m.Desc.Name())
 	}
 
+	path = joinPrefix(prefix, path)
+
 	body = rule.Body
 	responseBody = rule.ResponseBody
 	md := buildMethodDesc(g, m, method, path)
-	if method == http.MethodGet || method == http.MethodDelete {
-		if body != "" {
-			_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: %s %s body should not be declared.\n", method, path)
-		}
-	} else {
-		if body == "" {
-			_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: %s %s does not declare a body.\n", method, path)
+	// Client-streaming RPCs are served over WebSocket, whose handshake is always an
+	// HTTP GET regardless of the declared verb. Declaring a body for them is legitimate
+	// (it identifies the streamed message field), so skip the GET/DELETE body warnings.
+	if !m.Desc.IsStreamingClient() {
+		if method == http.MethodGet || method == http.MethodDelete {
+			if body != "" {
+				_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: %s %s body should not be declared.\n", method, path)
+			}
+		} else {
+			if body == "" {
+				_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: %s %s does not declare a body.\n", method, path)
+			}
 		}
 	}
+
 	if body == "*" {
 		md.HasBody = true
 		md.Body = ""
+		md.BodyField = "*"
+		md.BodyHTTPBody = isHTTPBodyMessage(m.Input.Desc)
 	} else if body != "" {
+		fd := m.Input.Desc.Fields().ByName(protoreflect.Name(body))
+		if fd == nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"\u001B[31mERROR\u001B[m: The corresponding body field '%s' declaration in request message could not be found in '%s'\n",
+				body,
+				path,
+			)
+			os.Exit(2)
+		}
 		md.HasBody = true
 		md.Body = "." + camelCaseVars(body)
+		md.BodyField = body
+		md.BodyQueryName = fd.JSONName()
+		md.BodyHTTPBody = isHTTPBodyField(fd)
+		// A singular message-kind body field can be streamed frame-by-frame for
+		// client-streaming RPCs (each frame carries just this field's payload).
+		md.BodyMessage = fd.Kind() == protoreflect.MessageKind && !fd.IsList() && !fd.IsMap()
 	} else {
 		md.HasBody = false
 	}
 	if responseBody == "*" {
 		md.ResponseBody = ""
 	} else if responseBody != "" {
+		fd := m.Output.Desc.Fields().ByName(protoreflect.Name(responseBody))
+		if fd == nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"\u001B[31mERROR\u001B[m: The corresponding response_body field '%s' declaration in response message could not be found in '%s'\n",
+				responseBody,
+				path,
+			)
+			os.Exit(2)
+		}
 		md.ResponseBody = "." + camelCaseVars(responseBody)
+		md.ResponseBodyHTTPBody = isHTTPBodyField(fd)
 	}
 	return md
+}
+
+func joinPrefix(prefix, p string) string {
+	if prefix == "" {
+		return p
+	}
+	return "/" + strings.Trim(prefix, "/") + "/" + strings.TrimLeft(p, "/")
 }
 
 func buildMethodDesc(g *protogen.GeneratedFile, m *protogen.Method, method, path string) *methodDesc {
 	defer func() { methodSets[m.GoName]++ }()
 
-	vars := buildPathVars(path)
+	// PathTemplate 保留原始路径模板给客户端 BuildPath 使用。
+	pathTemplate := path
+	vars, path := buildPathVars(path)
 
-	for v, s := range vars {
+	for v := range vars {
 		fields := m.Input.Desc.Fields()
-
-		if s != nil {
-			path = replacePath(v, *s, path)
+		fd := fields.ByName(protoreflect.Name(v))
+		if fd == nil {
+			_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mERROR\u001B[m: The corresponding field '%s' declaration in message could not be found in '%s'\n", v, path)
+			os.Exit(2)
 		}
-		for _, field := range strings.Split(v, ".") {
-			if strings.TrimSpace(field) == "" {
-				continue
-			}
-			if strings.Contains(field, ":") {
-				field = strings.Split(field, ":")[0]
-			}
-			fd := fields.ByName(protoreflect.Name(field))
-			if fd == nil {
-				_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mERROR\u001B[m: The corresponding field '%s' declaration in message could not be found in '%s'\n", v, path)
-				os.Exit(2)
-			}
-			if fd.IsMap() {
-				_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: The field in path:'%s' shouldn't be a map.\n", v)
-			} else if fd.IsList() {
-				_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: The field in path:'%s' shouldn't be a list.\n", v)
-			} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
-				fields = fd.Message().Fields()
-			}
+		if fd.IsMap() {
+			_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: The field in path:'%s' shouldn't be a map.\n", v)
+		} else if fd.IsList() {
+			_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: The field in path:'%s' shouldn't be a list.\n", v)
 		}
 	}
 	comment := m.Comments.Leading.String() + m.Comments.Trailing.String()
 	if comment != "" {
 		comment = "// " + m.GoName + strings.TrimPrefix(strings.TrimSuffix(comment, "\n"), "//")
 	}
-	return &methodDesc{
-		Name:         m.GoName,
-		OriginalName: string(m.Desc.Name()),
-		Num:          methodSets[m.GoName],
-		Request:      g.QualifiedGoIdent(m.Input.GoIdent),
-		Reply:        g.QualifiedGoIdent(m.Output.GoIdent),
-		Comment:      comment,
-		Path:         path,
-		Method:       method,
-		HasVars:      len(vars) > 0,
-	}
-}
-
-func buildPathVars(path string) (res map[string]*string) {
-	if strings.HasSuffix(path, "/") {
-		_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: Path %s should not end with \"/\" \n", path)
-	}
-	pattern := regexp.MustCompile(`(?i){([a-z.0-9_\s]*)=?([^{}]*)}`)
-	matches := pattern.FindAllStringSubmatch(path, -1)
-	res = make(map[string]*string, len(matches))
-	for _, m := range matches {
-		name := strings.TrimSpace(m[1])
-		if len(name) > 1 && len(m[2]) > 0 {
-			res[name] = &m[2]
-		} else {
-			res[name] = nil
+	if m.Desc.Options().(*descriptorpb.MethodOptions).GetDeprecated() {
+		if comment != "" {
+			comment += "\n"
 		}
+		comment += deprecationComment
 	}
-	return
+
+	return &methodDesc{
+		Name:            m.GoName,
+		OriginalName:    string(m.Desc.Name()),
+		Num:             methodSets[m.GoName],
+		Request:         g.QualifiedGoIdent(m.Input.GoIdent),
+		Reply:           g.QualifiedGoIdent(m.Output.GoIdent),
+		Comment:         comment,
+		Path:            path,
+		PathTemplate:    pathTemplate,
+		Method:          method,
+		HasVars:         len(vars) > 0,
+		ReplyHTTPBody:   isHTTPBodyMessage(m.Output.Desc),
+		ClientStreaming: m.Desc.IsStreamingClient(),
+		ServerStreaming: m.Desc.IsStreamingServer(),
+	}
 }
 
-func replacePath(name string, value string, path string) string {
-	pattern := regexp.MustCompile(fmt.Sprintf(`(?i){([\s]*%s\b[\s]*)=?([^{}]*)}`, name))
-	idx := pattern.FindStringIndex(path)
-	if len(idx) > 0 {
-		path = fmt.Sprintf("%s{%s:%s}%s",
-			path[:idx[0]], // The start of the match
-			name,
-			strings.ReplaceAll(value, "*", ".*"),
-			path[idx[1]:],
-		)
-	}
-	return path
+func isHTTPBodyField(fd protoreflect.FieldDescriptor) bool {
+	return fd != nil && fd.Kind() == protoreflect.MessageKind && isHTTPBodyMessage(fd.Message())
 }
 
-func isHttpMethod(method *protogen.Method) bool {
-	if method.Desc.IsStreamingClient() || method.Desc.IsStreamingServer() {
-		return false
-	}
-	return true
+func isHTTPBodyMessage(md protoreflect.MessageDescriptor) bool {
+	return md != nil && md.FullName() == httpBodyFullName
 }
 
 func hasHttpRule(services []*protogen.Service) bool {
 	for _, service := range services {
 		for _, method := range service.Methods {
-			if !isHttpMethod(method) {
-				continue
-			}
 			rule, ok := proto.GetExtension(method.Desc.Options(), annotations.E_Http).(*annotations.HttpRule)
 			if rule != nil && ok {
 				return true
@@ -258,6 +274,86 @@ func hasHttpRule(services []*protogen.Service) bool {
 		}
 	}
 	return false
+}
+
+func buildPathVars(path string) (map[string]struct{}, string) {
+	if strings.HasSuffix(path, "/") {
+		_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mWARN\u001B[m: Path %s should not end with \"/\" \n", path)
+	}
+	if err := validateServeMuxPath(path); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mERROR\u001B[m: invalid ServeMux-style http path %q: %s\n", path, err)
+		os.Exit(2)
+	}
+	vars, err := parsePathVars(path)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "\u001B[31mERROR\u001B[m: invalid ServeMux-style http path %q: %s\n", path, err)
+		os.Exit(2)
+	}
+	return vars, toMuxPath(path)
+}
+
+func validateServeMuxPath(path string) (err error) {
+	if !strings.HasPrefix(path, "/") {
+		return errors.New("path must start with /")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	http.NewServeMux().Handle(path, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	return nil
+}
+
+func parsePathVars(path string) (map[string]struct{}, error) {
+	pattern := regexp.MustCompile(`{([^{}]*)}`)
+	matches := pattern.FindAllStringSubmatchIndex(path, -1)
+	vars := make(map[string]struct{}, len(matches))
+	if len(matches) == 0 {
+		return vars, nil
+	}
+
+	for _, match := range matches {
+		start, end := match[0], match[1]
+		raw := strings.TrimSpace(path[match[2]:match[3]])
+		if raw == "$" {
+			continue
+		}
+		if raw == "" {
+			return nil, errors.New("empty path variable")
+		}
+		if start > 0 && path[start-1] != '/' {
+			return nil, fmt.Errorf("path variable {%s} must occupy a complete path segment", raw)
+		}
+		if end < len(path) && path[end] != '/' {
+			return nil, fmt.Errorf("path variable {%s} must occupy a complete path segment", raw)
+		}
+
+		catchAll := strings.HasSuffix(raw, "...")
+		name := raw
+		if catchAll {
+			name = strings.TrimSuffix(raw, "...")
+			if end != len(path) {
+				return nil, fmt.Errorf("catch-all path variable {%s} must be the final segment", raw)
+			}
+		}
+		if !pathVarNamePattern.MatchString(name) {
+			return nil, fmt.Errorf("path variable name %q must match %s", name, pathVarNamePattern.String())
+		}
+		if _, ok := vars[name]; ok {
+			return nil, fmt.Errorf("duplicate path variable %q", name)
+		}
+		vars[name] = struct{}{}
+	}
+	return vars, nil
+}
+
+func toMuxPath(path string) string {
+	if strings.HasSuffix(path, "/{$}") {
+		path = strings.TrimSuffix(path, "{$}")
+	}
+	pattern := regexp.MustCompile(`{([A-Za-z_][A-Za-z0-9_]*)\.\.\.}`)
+	return pattern.ReplaceAllString(path, `{$1:.*}`)
 }
 
 func camelCaseVars(s string) string {

@@ -1,0 +1,146 @@
+{{$svrType := .ServiceType}}
+{{$svrName := .ServiceName}}
+
+{{- range .MethodSets}}
+const Operation{{$svrType}}{{.OriginalName}} = "/{{$svrName}}/{{.OriginalName}}"
+{{- end}}
+
+type {{.ServiceType}}HTTPServer interface {
+{{- range .MethodSets}}
+	{{- if ne .Comment ""}}
+	{{.Comment}}
+	{{- end}}
+	{{- if .ClientStreaming}}
+	{{.Name}}({{$svrType}}_{{.Name}}Server) error
+	{{- else if .ServerStreaming}}
+	{{.Name}}(*{{.Request}}, {{$svrType}}_{{.Name}}Server) error
+	{{- else}}
+	{{.Name}}(context.Context, *{{.Request}}) (*{{.Reply}}, error)
+	{{- end}}
+{{- end}}
+}
+
+func Register{{.ServiceType}}HTTPServer(s *http.Server, srv {{.ServiceType}}HTTPServer) {
+	r := s.Route("/")
+	{{- range .Methods}}
+	{{- if .ClientStreaming}}
+	r.Handle("GET", "{{.Path}}", _{{$svrType}}_{{.Name}}{{.Num}}_HTTP_Handler(srv))
+	{{- else}}
+	r.Handle("{{.Method}}", "{{.Path}}", _{{$svrType}}_{{.Name}}{{.Num}}_HTTP_Handler(srv))
+	{{- end}}
+	{{- end}}
+}
+
+{{range .MethodSets}}
+{{- if or .ClientStreaming .ServerStreaming}}
+type {{$svrType}}_{{.Name}}HTTPServer struct {
+	http.ServerStream
+}
+
+{{- if .ServerStreaming}}
+func (x *{{$svrType}}_{{.Name}}HTTPServer) Send(m *{{.Reply}}) error {
+	return x.ServerStream.Send(m)
+}
+{{- end}}
+
+{{- if .ClientStreaming}}
+func (x *{{$svrType}}_{{.Name}}HTTPServer) Recv() (*{{.Request}}, error) {
+	m := new({{.Request}})
+	if err := x.ServerStream.Recv(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+{{- end}}
+
+{{- if and .ClientStreaming (not .ServerStreaming)}}
+func (x *{{$svrType}}_{{.Name}}HTTPServer) SendAndClose(m *{{.Reply}}) error {
+	return x.ServerStream.SendAndClose(m)
+}
+{{- end}}
+{{- end}}
+{{end}}
+
+{{range .Methods}}
+func _{{$svrType}}_{{.Name}}{{.Num}}_HTTP_Handler(srv {{$svrType}}HTTPServer) func(ctx http.Context) error {
+	return func(ctx http.Context) error {
+		{{- if .ClientStreaming}}
+		stream, err := http.NewWebSocketServerStream(ctx{{if .BodyMessage}}, http.WithStreamBodyField("{{.BodyField}}"){{end}})
+		if err != nil {
+			return err
+		}
+		http.SetOperation(ctx,Operation{{$svrType}}{{.OriginalName}})
+		h := ctx.Middleware(func(ctx context.Context, req interface{}) (interface{}, error) {
+			stream.SetContext(ctx)
+			return nil, srv.{{.Name}}(&{{$svrType}}_{{.Name}}HTTPServer{ServerStream: stream})
+		})
+		_, err = h(ctx, nil)
+		return stream.Close(err)
+		{{- else if .ServerStreaming}}
+		var in {{.Request}}
+		{{- if .HasBody}}
+		if err := ctx.Bind(&in{{.Body}}); err != nil {
+			return err
+		}
+		{{- end}}
+		{{- if not .HasBody}}
+		if err := ctx.BindQuery(&in); err != nil {
+			return err
+		}
+		{{- else if ne .BodyField "*"}}
+		if err := ctx.BindQuery(&in); err != nil {
+			return err
+		}
+		{{- end}}
+		{{- if .HasVars}}
+		if err := ctx.BindVars(&in); err != nil {
+			return err
+		}
+		{{- end}}
+		stream := http.NewServerSentEventServerStream(ctx)
+		http.SetOperation(ctx,Operation{{$svrType}}{{.OriginalName}})
+		h := ctx.Middleware(func(ctx context.Context, req interface{}) (interface{}, error) {
+			stream.SetContext(ctx)
+			return nil, srv.{{.Name}}(req.(*{{.Request}}), &{{$svrType}}_{{.Name}}HTTPServer{ServerStream: stream})
+		})
+		_, err := h(ctx, &in)
+		return stream.Close(err)
+		{{- else}}
+		var in {{.Request}}
+		{{- if .HasBody}}
+		if err := ctx.Bind(&in{{.Body}}); err != nil {
+			return err
+		}
+		{{- end}}
+		{{- if not .HasBody}}
+		if err := ctx.BindQuery(&in); err != nil {
+			return err
+		}
+		{{- else if ne .BodyField "*"}}
+		if err := ctx.BindQuery(&in); err != nil {
+			return err
+		}
+		{{- end}}
+		{{- if .HasVars}}
+		if err := ctx.BindVars(&in); err != nil {
+			return err
+		}
+		{{- end}}
+		http.SetOperation(ctx,Operation{{$svrType}}{{.OriginalName}})
+		h := ctx.Middleware(func(ctx context.Context, req interface{}) (interface{}, error) {
+			return srv.{{.Name}}(ctx, req.(*{{.Request}}))
+		})
+		out, err := h(ctx, &in)
+		if err != nil {
+			return err
+		}
+		reply := out.(*{{.Reply}})
+		{{- if or .ReplyHTTPBody .ResponseBodyHTTPBody}}
+		return ctx.Blob(200, http.BodyContentType(reply{{.ResponseBody}}), reply{{.ResponseBody}}.GetData())
+		{{- else}}
+		return ctx.Result(200, reply{{.ResponseBody}})
+		{{- end}}
+		{{- end}}
+	}
+}
+{{end}}

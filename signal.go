@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"os/signal"
+
+	"github.com/nexuer/log"
 )
 
 // SetupSignalHandler registered for SIGTERM and SIGINT. A stop channel is returned
@@ -23,9 +25,11 @@ func SetupSignalContext() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	signal.Notify(shutdownHandler, shutdownSignals...)
 	go func() {
-		<-shutdownHandler
+		sig := <-shutdownHandler
+		log.Infof("signal: received %s, shutting down gracefully", sig)
 		cancel()
-		<-shutdownHandler
+		sig = <-shutdownHandler
+		log.Warnf("signal: received %s again, forcing immediate exit", sig)
 		os.Exit(1) // second signal. Exit directly.
 	}()
 	return ctx

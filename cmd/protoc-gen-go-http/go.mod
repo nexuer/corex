@@ -1,8 +1,8 @@
 module github.com/nexuer/corex/cmd/protoc-gen-go-http
 
-go 1.23
+go 1.25.0
 
 require (
-	google.golang.org/genproto/googleapis/api v0.0.0-20241104194629-dd2ea8efbc28
-	google.golang.org/protobuf v1.35.1
+	google.golang.org/genproto/googleapis/api v0.0.0-20260908043556-f8649ddbbfe6
+	google.golang.org/protobuf v1.36.12
 )

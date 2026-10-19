@@ -1,0 +1,51 @@
+{{/* gotype: entgo.io/ent/entc/gen.Graph */}}
+{{ define "softdelete" }}
+{{ template "header" $ }}
+
+{{ $enabled := false }}
+{{ range $n := $.Nodes }}
+    {{ if hasKey $n.Annotations "SoftDelete" }}{{ $enabled = true }}{{ end }}
+{{ end }}
+{{ if $enabled }}
+import (
+    "context"
+    "time"
+
+    "entgo.io/ent"
+    "github.com/nexuer/corex/contrib/database/entx"
+    {{ range $n := $.Nodes }}
+        {{ if hasKey $n.Annotations "SoftDelete" }}
+            "{{ $n.Config.Package }}/{{ $n.Package }}"
+        {{ end }}
+    {{ end }}
+)
+{{ end }}
+
+// enableSoftDelete registers soft deletion for schemas using SoftDeleteMixin.
+// NewDatabase calls it once before using the client.
+// SkipSoftDelete includes deleted entities in queries and enables physical deletes.
+func enableSoftDelete(client *Client) {
+    {{ range $n := $.Nodes }}
+    {{ if hasKey $n.Annotations "SoftDelete" }}
+    client.{{ $n.Name }}.Intercept(ent.TraverseFunc(func(ctx context.Context, q ent.Query) error {
+        if !entx.SoftDeleteSkipped(ctx) {
+            q.(*{{ $n.Name }}Query).Where({{ $n.Package }}.DeletedAtIsNil())
+        }
+        return nil
+    }))
+    client.{{ $n.Name }}.Use(func(next ent.Mutator) ent.Mutator {
+        return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+            if !m.Op().Is(ent.OpDelete | ent.OpDeleteOne) || entx.SoftDeleteSkipped(ctx) {
+                return next.Mutate(ctx, m)
+            }
+            mutation := m.(*{{ $n.Name }}Mutation)
+            mutation.Where({{ $n.Package }}.DeletedAtIsNil())
+            mutation.SetOp(ent.OpUpdate)
+            mutation.SetDeletedAt(time.Now())
+            return mutation.Client().Mutate(ctx, mutation)
+        })
+    })
+    {{ end }}
+    {{ end }}
+}
+{{ end }}

@@ -1,0 +1,288 @@
+package main
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestNoParameters(t *testing.T) {
+	path := "/test/noparams"
+	m, err := parsePathVars(path)
+	if err != nil {
+		t.Fatalf("parsePathVars() error = %v", err)
+	}
+	if !reflect.DeepEqual(m, map[string]struct{}{}) {
+		t.Fatalf("Map should be empty")
+	}
+}
+
+func TestSingleParam(t *testing.T) {
+	path := "/test/{id}"
+	m, err := parsePathVars(path)
+	if err != nil {
+		t.Fatalf("parsePathVars() error = %v", err)
+	}
+	if !reflect.DeepEqual(m, map[string]struct{}{"id": {}}) {
+		t.Fatalf("vars = %#v", m)
+	}
+}
+
+func TestMultipleParams(t *testing.T) {
+	path := "/orgs/{org_id}/users/{user_id}"
+	m, err := parsePathVars(path)
+	if err != nil {
+		t.Fatalf("parsePathVars() error = %v", err)
+	}
+	if !reflect.DeepEqual(m, map[string]struct{}{
+		"org_id":  {},
+		"user_id": {},
+	}) {
+		t.Fatalf("vars = %#v", m)
+	}
+}
+
+func TestCatchAllParam(t *testing.T) {
+	path := "/files/{path...}"
+	m, err := parsePathVars(path)
+	if err != nil {
+		t.Fatalf("parsePathVars() error = %v", err)
+	}
+	if !reflect.DeepEqual(m, map[string]struct{}{"path": {}}) {
+		t.Fatalf("vars = %#v", m)
+	}
+}
+
+func TestToMuxPath(t *testing.T) {
+	if got := toMuxPath("/files/{path...}"); got != "/files/{path:.*}" {
+		t.Fatalf("toMuxPath() = %q", got)
+	}
+}
+
+func TestToMuxPathEndAnchor(t *testing.T) {
+	if got := toMuxPath("/"); got != "/" {
+		t.Fatalf("toMuxPath() = %q", got)
+	}
+	if got := toMuxPath("/{$}"); got != "/" {
+		t.Fatalf("toMuxPath() = %q", got)
+	}
+	if got := toMuxPath("/users/{$}"); got != "/users/" {
+		t.Fatalf("toMuxPath() = %q", got)
+	}
+}
+
+func TestValidateServeMuxStylePath(t *testing.T) {
+	tests := []string{
+		"/",
+		"/{$}",
+		"/test/noparams",
+		"/test/{id}",
+		"/orgs/{org_id}/users/{user_id}",
+		"/files/{path...}",
+	}
+	for _, tt := range tests {
+		t.Run(tt, func(t *testing.T) {
+			if err := validateServeMuxPath(tt); err != nil {
+				t.Fatalf("validateServeMuxPath(%q) error = %v", tt, err)
+			}
+		})
+	}
+}
+
+func TestInvalidServeMuxStylePathVars(t *testing.T) {
+	tests := []string{
+		"/test/{name=messages/*}",
+		"/test/{message.id}",
+		"/test/{id}/files/{path...}/tail",
+		"/test/{id}.json",
+		"/test/{}",
+	}
+	for _, tt := range tests {
+		t.Run(tt, func(t *testing.T) {
+			if _, err := parsePathVars(tt); err == nil {
+				t.Fatalf("parsePathVars(%q) error = nil", tt)
+			}
+		})
+	}
+}
+
+func TestInvalidServeMuxStylePath(t *testing.T) {
+	tests := []string{
+		"",
+		"test/{id}",
+		"/test/{id",
+		"/test/{}/tail",
+		"/test/{id}/files/{path...}/tail",
+		"/test/{id}.json",
+		"/test/{name=messages/*}",
+		"/test/{message.id}",
+		"/test/{path...}/tail",
+		"/test/{id}/{id}",
+		"GET /test/{id}",
+		"example.com/test/{id}",
+	}
+	for _, tt := range tests {
+		t.Run(tt, func(t *testing.T) {
+			if err := validateServeMuxPath(tt); err == nil {
+				t.Fatalf("validateServeMuxPath(%q) error = nil", tt)
+			}
+		})
+	}
+}
+
+func TestHTTPTemplateClientUsesBuildPathAndProtoJSONHeaders(t *testing.T) {
+	sd := &serviceDesc{
+		ServiceType: "Greeter",
+		ServiceName: "helloworld.Greeter",
+		Methods: []*methodDesc{
+			{
+				Name:         "SayHello",
+				OriginalName: "SayHello",
+				Request:      "HelloRequest",
+				Reply:        "HelloReply",
+				Path:         "/helloworld/{name}",
+				PathTemplate: "/helloworld/{name}",
+				Method:       "GET",
+				HasVars:      true,
+			},
+			{
+				Name:         "CreateHello",
+				OriginalName: "CreateHello",
+				Request:      "CreateHelloRequest",
+				Reply:        "HelloReply",
+				Path:         "/helloworld",
+				PathTemplate: "/helloworld",
+				Method:       "POST",
+				HasBody:      true,
+				Body:         "",
+			},
+		},
+	}
+	got := sd.execute()
+	for _, want := range []string{
+		`path := http.BuildPath(pattern, in, http.WithQueryParams())`,
+		`path := http.BuildPath(pattern, in)`,
+		`http.Accept("application/protojson")`,
+		`http.ContentType("application/protojson")`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("generated template missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "binding.") {
+		t.Fatalf("generated template should not reference binding package:\n%s", got)
+	}
+}
+
+func TestHTTPTemplateStreamsAndHTTPBody(t *testing.T) {
+	sd := &serviceDesc{
+		ServiceType: "Greeter",
+		ServiceName: "helloworld.Greeter",
+		Methods: []*methodDesc{
+			{
+				Name:            "ListHello",
+				OriginalName:    "ListHello",
+				Request:         "ListHelloRequest",
+				Reply:           "HelloReply",
+				Path:            "/helloworld",
+				PathTemplate:    "/helloworld",
+				Method:          "GET",
+				ServerStreaming: true,
+			},
+			{
+				Name:            "ChatHello",
+				OriginalName:    "ChatHello",
+				Request:         "HelloRequest",
+				Reply:           "HelloReply",
+				Path:            "/helloworld/chat",
+				PathTemplate:    "/helloworld/chat",
+				Method:          "POST",
+				ClientStreaming: true,
+				ServerStreaming: true,
+			},
+			{
+				Name:          "UploadHello",
+				OriginalName:  "UploadHello",
+				Request:       "UploadHelloRequest",
+				Reply:         "UploadHelloReply",
+				Path:          "/helloworld/upload",
+				PathTemplate:  "/helloworld/upload",
+				Method:        "POST",
+				HasBody:       true,
+				Body:          ".Body",
+				BodyField:     "body",
+				BodyQueryName: "body",
+				BodyHTTPBody:  true,
+				ResponseBody:  ".Body",
+			},
+			{
+				Name:            "ChatData",
+				OriginalName:    "ChatData",
+				Request:         "ChatDataRequest",
+				Reply:           "ChatDataReply",
+				Path:            "/v1/bitto/chat",
+				PathTemplate:    "/v1/bitto/chat",
+				Method:          "GET",
+				HasBody:         true,
+				Body:            ".Data",
+				BodyField:       "data",
+				BodyQueryName:   "data",
+				BodyMessage:     true,
+				ClientStreaming: true,
+				ServerStreaming: true,
+			},
+			{
+				// Client-streaming RPC whose named body is a scalar field: it is not
+				// streamable frame-by-frame, so the whole message is sent/decoded.
+				Name:            "ChatText",
+				OriginalName:    "ChatText",
+				Request:         "ChatTextRequest",
+				Reply:           "ChatTextReply",
+				Path:            "/v1/bitto/text",
+				PathTemplate:    "/v1/bitto/text",
+				Method:          "GET",
+				HasBody:         true,
+				Body:            ".Text",
+				BodyField:       "text",
+				BodyQueryName:   "text",
+				BodyMessage:     false,
+				ClientStreaming: true,
+				ServerStreaming: true,
+			},
+		},
+	}
+	got := sd.execute()
+	for _, want := range []string{
+		`ListHello(*ListHelloRequest, Greeter_ListHelloServer) error`,
+		`stream := http.NewServerSentEventServerStream(ctx)`,
+		`stream, err := c.cc.ServerSentEvent(ctx, "GET", path, nil, opts...)`,
+		`ChatHello(Greeter_ChatHelloServer) error`,
+		`stream, err := http.NewWebSocketServerStream(ctx)`,
+		`func (x *Greeter_ChatHelloHTTPClient) open(m *HelloRequest) error`,
+		`path := http.BuildPath(x.pattern, m, http.WithQueryParams())`,
+		`stream, err := x.cc.WebSocket(x.ctx, path, opts...)`,
+		`http.ContentType("application/protojson")`,
+		`return &Greeter_ChatHelloHTTPClient{ctx: ctx, cc: c.cc, pattern: pattern, opts: opts}, nil`,
+		`http.ContentType(http.BodyContentType(in.Body))`,
+		`http.WithOmitFields("body")`,
+		`return ctx.Result(200, reply.Body)`,
+		// Client-streaming RPC with a streamable (message-kind) named body field.
+		`stream, err := http.NewWebSocketServerStream(ctx, http.WithStreamBodyField("data"))`,
+		`return x.ClientStream.Send(m.Data)`,
+		// Client-streaming RPC with a scalar named body: whole message is streamed.
+		`func (x *Greeter_ChatTextHTTPClient) Send(m *ChatTextRequest) error`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("generated template missing %q in:\n%s", want, got)
+		}
+	}
+	// The whole-message streaming client (ChatHello) and the scalar-body streaming
+	// client (ChatText) must both send the whole message, not a sub-field.
+	if !strings.Contains(got, "return x.ClientStream.Send(m)\n") {
+		t.Fatalf("generated template should send whole message for non-streamable body:\n%s", got)
+	}
+	// The scalar-body server handler must NOT receive a stream body-field option.
+	if strings.Contains(got, `http.WithStreamBodyField("text")`) {
+		t.Fatalf("scalar named body should not emit WithStreamBodyField:\n%s", got)
+	}
+}

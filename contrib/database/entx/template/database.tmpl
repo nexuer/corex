@@ -1,0 +1,140 @@
+{{/* The line below tells Intellij/GoLand to enable the autocompletion based on the *gen.Graph type. */}}
+{{/* gotype: entgo.io/ent/entc/gen.Graph */}}
+
+
+{{ define "database" }}
+
+{{ template "header" $ }}
+
+import (
+    "context"
+    "fmt"
+
+    "entgo.io/ent/dialect/sql"
+)
+
+
+// Database is the client that holds all ent builders.
+type Database struct {
+    client *Client
+}
+
+// NewDatabase creates a new database configured with the given options.
+func NewDatabase(opts ...Option) *Database {
+    client := NewClient(opts...)
+    enableSoftDelete(client)
+    return &Database{client: client}
+}
+
+func (db *Database) clone(opts ...Option) *Database {
+    client := &Client{config: db.client.config}
+    client.config.options(opts...)
+    client.init()
+    return &Database{client: client}
+}
+
+// InTx runs the given function f within a transaction.
+func (db *Database) InTx(ctx context.Context, f func(txCtx context.Context) error, opts ...*sql.TxOptions) error {
+    tx := TxFromContext(ctx)
+    if tx != nil {
+        return f(ctx)
+    }
+
+    var err error
+    if len(opts) > 0 && opts[0] != nil {
+        tx, err = db.client.BeginTx(ctx, opts[0])
+    } else {
+        tx, err = db.client.Tx(ctx)
+    }
+
+    if err != nil {
+        return fmt.Errorf("starting transaction: %w", err)
+    }
+
+    defer func() {
+        if v := recover(); v != nil {
+            if err = tx.Rollback(); err != nil {
+                panic(fmt.Errorf("rolling back transaction: %w. panic: %s", err, v))
+            }
+            panic(v)
+        }
+    }()
+
+    if err = f(NewTxContext(ctx, tx)); err != nil {
+        if err2 := tx.Rollback(); err2 != nil {
+            return fmt.Errorf("rolling back transaction: %v (exec error: %w)", err2, err)
+        }
+        return err
+    }
+
+    if err = tx.Commit(); err != nil {
+        return fmt.Errorf("committing transaction: %w", err)
+    }
+    return nil
+}
+
+func (db *Database) loadClient(ctx context.Context) *Client {
+    tx := TxFromContext(ctx)
+    if tx != nil {
+        return tx.Client()
+    }
+    return db.client
+}
+
+func (db *Database) Client() *Client {
+    return db.client
+}
+
+// Exec executes a query that doesn't return rows. For example, in SQL, INSERT or UPDATE.
+func (db *Database) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+    var res sql.Result
+    err := db.loadClient(ctx).driver.Exec(ctx, query, args, &res)
+    if err != nil {
+        return nil, err
+    }
+    return res, nil
+}
+
+// Query executes a query that returns rows, typically a SELECT in SQL.
+func (db *Database) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+    var rows sql.Rows
+    err := db.loadClient(ctx).driver.Query(ctx, query, args, &rows)
+    if err != nil {
+        return nil, err
+    }
+    return &rows, nil
+}
+
+{{ if $.FeatureEnabled "sql/schemaconfig" }}
+func NewSchemaConfig(schema string) SchemaConfig {
+    return SchemaConfig{
+        {{- range $n := $.Nodes }}
+        {{ $n.Name }}: schema,
+        {{- range $e := $n.Edges }}
+            {{- if and $e.M2M (not $e.Inverse) }}
+        {{ $n.Name }}{{ $e.StructField }}: schema,
+            {{- end }}
+        {{- end }}
+        {{- end }}
+    }
+}
+
+func (db *Database) WithSchema(schema string) *Database {
+    return db.WithSchemaConfig(NewSchemaConfig(schema))
+}
+
+func (db *Database) WithSchemaConfig(cfg SchemaConfig) *Database {
+    return db.clone(AlternateSchema(cfg))
+}
+{{ end }}
+
+{{ range $n := $.Nodes }}
+    {{ $client := print $n.Name "Client" }}
+    // {{ $n.Name }} is the client for interacting with the {{ $n.Name }} builders.
+    // It determines whether to use transactions based on the provided Context.
+    func (db *Database) {{ $n.Name }}(ctx context.Context) *{{ $client }} {
+        return db.loadClient(ctx).{{ $n.Name }}
+    }
+{{ end }}
+
+{{ end }}
